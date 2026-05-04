@@ -25,7 +25,7 @@ import pricing
 
 DATA_DIR = Path(__file__).parent / "data"
 REFRESH_SECONDS = 60
-BGN_PER_EUR = 1.95583  # fixed peg (display only — values in xlsx are EUR)
+BGN_PER_EUR = 1.95583  # fixed peg (display only)
 
 
 # ---------------------------------------------------------------------------
@@ -38,11 +38,31 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# Auto-refresh: re-runs the script every REFRESH_SECONDS without user action.
-# Uses streamlit's built-in fragment-style rerun via st.experimental_set_query_params trick.
-# Cleanest cross-version approach: a small JS embed.
+# Auto-refresh every 60 s — meta tag is the most portable approach across
+# Streamlit Cloud / Render / local without a websocket trick.
 st.markdown(
     f"<meta http-equiv='refresh' content='{REFRESH_SECONDS}'>",
+    unsafe_allow_html=True,
+)
+
+# A bit of CSS polish: tighter spacing, monospace numbers, nicer card look.
+st.markdown(
+    """
+    <style>
+      .block-container { padding-top: 1.6rem; padding-bottom: 2rem; }
+      h1 { font-size: 1.9rem !important; margin-bottom: 0.2rem; }
+      h3 { font-size: 1.05rem !important; margin-top: 0.4rem !important;
+           color: #aab4c0; font-weight: 600; letter-spacing: 0.02em; }
+      .fund-subtitle { color: #8a96a3; font-size: 0.92rem; margin-top: 0; margin-bottom: 1.0rem; }
+      .stMetric { background: #161b24; padding: 12px 16px; border-radius: 10px;
+                  border: 1px solid #232a36; }
+      .stMetric label { color: #8a96a3 !important; font-size: 0.8rem !important; }
+      [data-testid="stMetricValue"] { font-variant-numeric: tabular-nums; }
+      [data-testid="stMetricDelta"] { font-variant-numeric: tabular-nums; }
+      .stDataFrame { font-variant-numeric: tabular-nums; }
+      div[data-testid="stHorizontalBlock"] { gap: 1rem; }
+    </style>
+    """,
     unsafe_allow_html=True,
 )
 
@@ -51,8 +71,6 @@ st.markdown(
 # Data loading (cached on file mtimes)
 # ---------------------------------------------------------------------------
 def _data_signature(folder: Path) -> tuple:
-    """A cache key that changes whenever any xlsx in `data/` is edited or
-    when files appear/disappear."""
     return tuple(sorted(
         (p.name, p.stat().st_mtime_ns)
         for p in folder.glob("*.xlsx")
@@ -62,8 +80,6 @@ def _data_signature(folder: Path) -> tuple:
 
 @st.cache_data(show_spinner=False)
 def load_funds(signature: tuple):
-    """Parse every .xlsx in data/. Cache key = file mtimes, so editing /
-    adding a file invalidates this automatically."""
     funds = fund_parser.parse_data_dir(DATA_DIR)
     for f in funds:
         enrich_fund(f)
@@ -71,16 +87,9 @@ def load_funds(signature: tuple):
 
 
 # ---------------------------------------------------------------------------
-# Live pricing — re-priced on every script run (no streamlit cache here, the
-# pricing module handles its own short TTL)
+# Live re-pricing
 # ---------------------------------------------------------------------------
 def reprice_fund(fund) -> dict:
-    """Compute live NAV and per-holding daily change for one fund.
-
-    Returns a dict with:
-      live_nav, prev_nav, live_nav_per_unit, prev_nav_per_unit,
-      change_abs, change_pct, holdings_df, fx_used, stale_count
-    """
     eurusd = pricing.get_eurusd()
     book_usd_eur = fund.fx_rates.get("USD/EUR", 0.92)
     usd_eur = pricing.usd_to_eur(eurusd, fallback_usd_eur=book_usd_eur)
@@ -97,6 +106,7 @@ def reprice_fund(fund) -> dict:
         prev_price = h.price_dirty
         is_live = False
         note = ""
+        ret_pct = 0.0  # daily return % for this holding (live vs prev close)
 
         q = pricing.get_quote(h.ticker) if h.ticker else None
 
@@ -112,13 +122,13 @@ def reprice_fund(fund) -> dict:
                 live_mv = h.quantity * q.last / BGN_PER_EUR
                 prev_mv = h.quantity * q.prev / BGN_PER_EUR
             else:
-                # unknown currency: scale proportionally from xlsx mv
                 ratio = q.last / q.prev if q.prev else 1.0
                 live_mv = h.market_value * ratio
                 prev_mv = h.market_value
             live_price = q.last
             prev_price = q.prev
             is_live = True
+            ret_pct = (q.last / q.prev - 1) * 100 if q.prev else 0.0
         else:
             stale_count += 1
             note = (q.error if q else "no ticker") or "no live data"
@@ -137,16 +147,14 @@ def reprice_fund(fund) -> dict:
             "Quantity": h.quantity,
             "Price (book)": h.price_dirty,
             "Price (live)": live_price,
-            "Market value (live, EUR)": live_mv,
+            "MV (EUR)": live_mv,
             "Δ (EUR)": live_mv - prev_mv,
-            "Δ (%)": ((live_mv / prev_mv - 1) * 100) if prev_mv else 0.0,
-            "Weight": 0.0,  # filled in below
+            "Δ (%)": ret_pct,                   # daily return for this holding
+            "Weight": 0.0,                      # filled below
             "Live": "✓" if is_live else "—",
             "Note": note,
         })
 
-    # Non-holdings ("other assets") = cash + receivables + deferred expenses.
-    # Easiest to derive from the xlsx totals: total_assets − Σ holdings(book).
     book_holdings_total = sum(h.market_value for h in fund.holdings)
     other_assets = (fund.total_assets or (book_holdings_total + sum(c.market_value for c in fund.cash))) - book_holdings_total
     cash_total = sum(c.market_value for c in fund.cash)
@@ -155,12 +163,19 @@ def reprice_fund(fund) -> dict:
     live_nav = live_holdings_total + other_assets - liabilities
     prev_nav = prev_holdings_total + other_assets - liabilities
 
-    # Compute weights against the live total assets (holdings + other)
+    # Weight each holding as a fraction of total live assets.
     live_total_assets = live_holdings_total + other_assets
     for r in rows:
-        r["Weight"] = (r["Market value (live, EUR)"] / live_total_assets) if live_total_assets else 0.0
+        r["Weight"] = (r["MV (EUR)"] / live_total_assets) if live_total_assets else 0.0
 
     df = pd.DataFrame(rows)
+
+    # NAV % change via SUMPRODUCT(weight × daily_return).
+    # Cash and other non-traded assets contribute 0 (no daily return).
+    if not df.empty:
+        nav_change_pct = float((df["Weight"] * df["Δ (%)"]).sum())
+    else:
+        nav_change_pct = 0.0
 
     units = fund.units_outstanding or 1
     return {
@@ -170,7 +185,7 @@ def reprice_fund(fund) -> dict:
         "live_nav_per_unit": live_nav / units,
         "prev_nav_per_unit": prev_nav / units,
         "change_abs": live_nav - prev_nav,
-        "change_pct": ((live_nav / prev_nav - 1) * 100) if prev_nav else 0.0,
+        "change_pct": nav_change_pct,                 # SUMPRODUCT-based
         "change_per_unit_abs": (live_nav - prev_nav) / units,
         "holdings_df": df,
         "live_holdings_total": live_holdings_total,
@@ -185,121 +200,67 @@ def reprice_fund(fund) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Layout
+# Render helpers
 # ---------------------------------------------------------------------------
-def fmt_money(v: float, ccy: str = "BGN", decimals: int = 2) -> str:
-    if v is None:
-        return "—"
-    return f"{v:,.{decimals}f} {ccy}"
-
-
-def fmt_pct(v: float, decimals: int = 2) -> str:
-    if v is None:
-        return "—"
-    return f"{v:+.{decimals}f}%"
+def render_title(fund) -> None:
+    st.markdown(f"# {fund.fund_name}")
+    st.markdown(
+        f"<div class='fund-subtitle'>"
+        f"Reporting date <b>{fund.reporting_date.isoformat()}</b> · "
+        f"Live re-pricing via yfinance · auto-refresh {REFRESH_SECONDS}s · "
+        f"last tick {datetime.now():%H:%M:%S}"
+        f"</div>",
+        unsafe_allow_html=True,
+    )
 
 
 def render_kpis(view: dict) -> None:
-    nav = view["live_nav"]
-    chg_abs = view["change_abs"]
+    """Single row of clean KPI cards. Numbers only — no captions."""
     chg_pct = view["change_pct"]
-    nav_unit = view["live_nav_per_unit"]
+    chg_abs = view["change_abs"]
     chg_unit = view["change_per_unit_abs"]
-    fund = view["fund"]
-    n_holdings = len(view["holdings_df"])
-    n_currencies = view["holdings_df"]["Currency"].replace("", pd.NA).dropna().nunique()
-    top_w = view["holdings_df"]["Weight"].max() if not view["holdings_df"].empty else 0
-
-    c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric(
+    df = view["holdings_df"]
+    cols = st.columns(5)
+    cols[0].metric(
         "Live NAV / unit (EUR)",
-        f"{nav_unit:,.4f}",
-        delta=f"{chg_unit:+,.4f}  ({chg_pct:+.2f}%)",
+        f"{view['live_nav_per_unit']:.4f}",
+        delta=f"{chg_unit:+,.4f}",
     )
-    c2.metric("Live NAV (EUR)", f"{nav:,.0f}", delta=f"{chg_abs:+,.0f}")
-    c3.metric("Holdings", f"{n_holdings}")
-    c4.metric("Currencies", f"{n_currencies}")
-    c5.metric("Top holding wt.", f"{top_w*100:.1f}%")
-
-    sub = st.columns(4)
-    sub[0].caption(f"Reporting date: **{fund.reporting_date.isoformat()}**")
-    sub[1].caption(f"Units outstanding: **{fund.units_outstanding:,.4f}**")
-    sub[2].caption(f"USD→EUR live: **{view['fx_used']:.4f}**  (book {view['fx_book']:.4f})")
-    sub[3].caption(f"Stale (no live): **{view['stale_count']}** of {n_holdings}")
-
-
-def render_allocation_charts(df: pd.DataFrame) -> None:
-    if df.empty:
-        st.info("No holdings to display.")
-        return
-
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        st.markdown("**Asset class**")
-        agg = df.groupby("Asset class", as_index=False)["Market value (live, EUR)"].sum()
-        fig = px.pie(agg, names="Asset class", values="Market value (live, EUR)", hole=0.45)
-        fig.update_layout(showlegend=True, height=320, margin=dict(l=0, r=0, t=10, b=0))
-        st.plotly_chart(fig, use_container_width=True)
-
-    with c2:
-        st.markdown("**Currency**")
-        agg = (df.assign(Currency=df["Currency"].replace("", "—"))
-                 .groupby("Currency", as_index=False)["Market value (live, EUR)"].sum())
-        fig = px.pie(agg, names="Currency", values="Market value (live, EUR)", hole=0.45)
-        fig.update_layout(showlegend=True, height=320, margin=dict(l=0, r=0, t=10, b=0))
-        st.plotly_chart(fig, use_container_width=True)
-
-    with c3:
-        st.markdown("**Country**")
-        agg = (df.assign(Country=df["Country"].replace("", "Unknown"))
-                 .groupby("Country", as_index=False)["Market value (live, EUR)"].sum())
-        fig = px.pie(agg, names="Country", values="Market value (live, EUR)", hole=0.45)
-        fig.update_layout(showlegend=True, height=320, margin=dict(l=0, r=0, t=10, b=0))
-        st.plotly_chart(fig, use_container_width=True)
-
-
-def render_sector_chart(df: pd.DataFrame) -> None:
-    if df.empty:
-        return
-    agg = (df.groupby("Sector", as_index=False)["Market value (live, EUR)"].sum()
-             .sort_values("Market value (live, EUR)", ascending=False))
-    fig = px.pie(agg, names="Sector", values="Market value (live, EUR)", hole=0.4)
-    fig.update_layout(height=380, margin=dict(l=0, r=0, t=20, b=0))
-    st.plotly_chart(fig, use_container_width=True)
-
-
-def render_top10(df: pd.DataFrame) -> None:
-    if df.empty:
-        return
-    top = (df.sort_values("Market value (live, EUR)", ascending=True).tail(10))
-    fig = go.Figure(go.Bar(
-        x=top["Market value (live, EUR)"],
-        y=top["Security"].str[:40],
-        orientation="h",
-        text=[f"{v*100:.1f}%" for v in top["Weight"]],
-        textposition="outside",
-        marker=dict(color="#4ea1ff"),
-    ))
-    fig.update_layout(
-        height=380,
-        margin=dict(l=0, r=20, t=10, b=0),
-        xaxis_title="Market value (EUR)",
-        yaxis_title=None,
+    cols[1].metric(
+        "Daily NAV change",
+        f"{chg_pct:+.2f}%",
+        delta=f"{chg_abs:+,.0f} EUR",
     )
-    st.plotly_chart(fig, use_container_width=True)
+    cols[2].metric("Live NAV (EUR)", f"{view['live_nav']:,.0f}")
+    cols[3].metric("Holdings", f"{len(df)}")
+    cols[4].metric(
+        "Stale (no live)",
+        f"{view['stale_count']}",
+        help="Holdings without a live quote — held flat at book value.",
+    )
 
 
-def render_holdings_table(df: pd.DataFrame) -> None:
+def render_holdings_table(df: pd.DataFrame, key_prefix: str = "") -> None:
     if df.empty:
         st.info("No holdings.")
         return
 
     with st.container():
-        c1, c2, c3, c4 = st.columns([2, 1, 1, 1])
-        search = c1.text_input("Search", placeholder="Filter by security / ticker / ISIN…")
-        classes = c2.multiselect("Asset class", sorted(df["Asset class"].unique()))
-        ccys = c3.multiselect("Currency", sorted(c for c in df["Currency"].unique() if c))
-        sectors = c4.multiselect("Sector", sorted(df["Sector"].unique()))
+        c1, c2, c3 = st.columns([3, 2, 2])
+        search = c1.text_input(
+            "Search", placeholder="Filter by security / ticker / ISIN…",
+            key=f"{key_prefix}search", label_visibility="collapsed",
+        )
+        classes = c2.multiselect(
+            "Asset class", sorted(df["Asset class"].unique()),
+            key=f"{key_prefix}classes", placeholder="All asset classes",
+            label_visibility="collapsed",
+        )
+        sectors = c3.multiselect(
+            "Sector", sorted(df["Sector"].unique()),
+            key=f"{key_prefix}sectors", placeholder="All sectors",
+            label_visibility="collapsed",
+        )
 
     view = df.copy()
     if search:
@@ -310,34 +271,36 @@ def render_holdings_table(df: pd.DataFrame) -> None:
         view = view[mask]
     if classes:
         view = view[view["Asset class"].isin(classes)]
-    if ccys:
-        view = view[view["Currency"].isin(ccys)]
     if sectors:
         view = view[view["Sector"].isin(sectors)]
 
-    display = view.copy()
-    display["Weight"] = (display["Weight"] * 100).round(2)
-    display["Δ (%)"] = display["Δ (%)"].round(2)
-    display["Market value (live, EUR)"] = display["Market value (live, EUR)"].round(2)
-    display["Δ (EUR)"] = display["Δ (EUR)"].round(2)
-    display["Quantity"] = display["Quantity"].round(2)
-    display["Price (live)"] = display["Price (live)"].round(4)
-    display["Price (book)"] = display["Price (book)"].round(4)
+    # Drop rarely-needed columns so the table fits cleanly on the left half.
+    display = view[[
+        "Security", "Ticker", "Asset class", "Sector",
+        "Quantity", "Price (live)", "MV (EUR)", "Weight",
+        "Δ (%)", "Live",
+    ]].copy()
+    display["Weight"] = display["Weight"] * 100
 
     st.dataframe(
-        display,
+        display.sort_values("MV (EUR)", ascending=False),
         use_container_width=True,
         hide_index=True,
-        height=460,
+        height=520,
         column_config={
-            "Weight": st.column_config.NumberColumn("Weight %", format="%.2f%%"),
+            "Security": st.column_config.TextColumn("Security", width="medium"),
+            "Ticker": st.column_config.TextColumn("Ticker", width="small"),
+            "Asset class": st.column_config.TextColumn("Class", width="small"),
+            "Sector": st.column_config.TextColumn("Sector", width="small"),
+            "Quantity": st.column_config.NumberColumn("Qty", format="%.0f"),
+            "Price (live)": st.column_config.NumberColumn("Px", format="%.2f"),
+            "MV (EUR)": st.column_config.NumberColumn("MV (EUR)", format="%.0f"),
+            "Weight": st.column_config.NumberColumn("Wt %", format="%.2f%%"),
             "Δ (%)": st.column_config.NumberColumn("Δ %", format="%+.2f%%"),
-            "Market value (live, EUR)": st.column_config.NumberColumn("MV (EUR)", format="%.2f"),
-            "Δ (EUR)": st.column_config.NumberColumn("Δ EUR", format="%+.2f"),
+            "Live": st.column_config.TextColumn("●", width="small"),
         },
     )
 
-    # --- Export buttons
     csv_bytes = view.to_csv(index=False).encode("utf-8")
     excel_buf = io.BytesIO()
     with pd.ExcelWriter(excel_buf, engine="openpyxl") as xl:
@@ -346,52 +309,123 @@ def render_holdings_table(df: pd.DataFrame) -> None:
 
     e1, e2, _ = st.columns([1, 1, 6])
     e1.download_button(
-        "⬇ CSV",
-        data=csv_bytes,
+        "⬇ CSV", data=csv_bytes,
         file_name=f"holdings_{datetime.now():%Y%m%d_%H%M}.csv",
-        mime="text/csv",
-        use_container_width=True,
+        mime="text/csv", key=f"{key_prefix}csv", use_container_width=True,
     )
     e2.download_button(
-        "⬇ Excel",
-        data=excel_buf.getvalue(),
+        "⬇ Excel", data=excel_buf.getvalue(),
         file_name=f"holdings_{datetime.now():%Y%m%d_%H%M}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        use_container_width=True,
+        key=f"{key_prefix}xlsx", use_container_width=True,
     )
 
 
-def render_nav_history(funds: list, fund_label: str | None) -> None:
-    """If multiple xlsx files exist for the same fund (different reporting
-    dates), draw NAV/unit over time."""
-    rows = []
-    for f in funds:
-        if fund_label and f.fund_name != fund_label:
-            continue
-        rows.append({
-            "Date": f.reporting_date,
-            "Fund": f.fund_name,
-            "NAV/unit": f.nav_per_unit,
-        })
+def _pie(df: pd.DataFrame, key: str, height: int = 520) -> go.Figure:
+    agg = (df.groupby(key, as_index=False)["MV (EUR)"].sum()
+             .sort_values("MV (EUR)", ascending=False))
+    fig = px.pie(agg, names=key, values="MV (EUR)", hole=0.5)
+    fig.update_traces(textposition="inside", textinfo="percent+label",
+                      hovertemplate="<b>%{label}</b><br>EUR %{value:,.0f}<br>%{percent}")
+    fig.update_layout(
+        height=height,
+        margin=dict(l=0, r=0, t=10, b=0),
+        legend=dict(orientation="v", yanchor="middle", y=0.5, x=1.02, font=dict(size=11)),
+        showlegend=True,
+    )
+    return fig
+
+
+def render_sector_pie(df: pd.DataFrame) -> None:
+    if df.empty:
+        return
+    st.plotly_chart(_pie(df, "Sector", height=520), use_container_width=True)
+
+
+def _allocation_table(df: pd.DataFrame, group_col: str, label: str) -> None:
+    """Compact tabular allocation breakdown — alternative to a pie chart."""
+    agg = (df.groupby(group_col, as_index=False)["MV (EUR)"].sum()
+             .sort_values("MV (EUR)", ascending=False))
+    total = agg["MV (EUR)"].sum() or 1
+    agg["Weight %"] = (agg["MV (EUR)"] / total * 100).round(2)
+    agg["MV (EUR)"] = agg["MV (EUR)"].round(0)
+    agg = agg.rename(columns={group_col: label})
+    st.dataframe(
+        agg,
+        use_container_width=True,
+        hide_index=True,
+        height=min(40 + len(agg) * 35, 260),
+        column_config={
+            label: st.column_config.TextColumn(label),
+            "MV (EUR)": st.column_config.NumberColumn("MV (EUR)", format="%.0f"),
+            "Weight %": st.column_config.NumberColumn("Weight %", format="%.2f%%"),
+        },
+    )
+
+
+def render_secondary_allocations(df: pd.DataFrame) -> None:
+    if df.empty:
+        return
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.markdown("### Asset class")
+        _allocation_table(df, "Asset class", "Asset class")
+    with c2:
+        st.markdown("### Currency")
+        _allocation_table(df.assign(Currency=df["Currency"].replace("", "—")),
+                          "Currency", "Currency")
+    with c3:
+        st.markdown("### Country")
+        _allocation_table(df.assign(Country=df["Country"].replace("", "Unknown")),
+                          "Country", "Country")
+
+
+def render_top10(df: pd.DataFrame) -> None:
+    if df.empty:
+        return
+    top = df.sort_values("MV (EUR)", ascending=True).tail(10).copy()
+    fig = go.Figure(go.Bar(
+        x=top["MV (EUR)"],
+        y=top["Security"].str[:42],
+        orientation="h",
+        text=[f"{v*100:.1f}%" for v in top["Weight"]],
+        textposition="outside",
+        marker=dict(color="#4ea1ff", line=dict(width=0)),
+        hovertemplate="<b>%{y}</b><br>EUR %{x:,.0f}<extra></extra>",
+    ))
+    fig.update_layout(
+        height=380,
+        margin=dict(l=0, r=24, t=10, b=0),
+        xaxis_title="Market value (EUR)",
+        yaxis_title=None,
+        plot_bgcolor="rgba(0,0,0,0)",
+        paper_bgcolor="rgba(0,0,0,0)",
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+
+def render_nav_history(funds: list, fund_label: str) -> None:
+    rows = [
+        {"Date": f.reporting_date, "NAV/unit": f.nav_per_unit}
+        for f in funds if f.fund_name == fund_label
+    ]
     if len(rows) < 2:
         st.caption("Drop more dated xlsx files into `data/` to build a NAV history chart.")
         return
-    hist = pd.DataFrame(rows)
-    fig = px.line(hist, x="Date", y="NAV/unit", color="Fund", markers=True)
-    fig.update_layout(height=260, margin=dict(l=0, r=0, t=10, b=0))
+    hist = pd.DataFrame(rows).sort_values("Date")
+    fig = px.line(hist, x="Date", y="NAV/unit", markers=True)
+    fig.update_traces(line=dict(color="#4ea1ff", width=2))
+    fig.update_layout(
+        height=240, margin=dict(l=0, r=0, t=10, b=0),
+        plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
+    )
     st.plotly_chart(fig, use_container_width=True)
 
 
 # ---------------------------------------------------------------------------
-# Main flow
+# Main
 # ---------------------------------------------------------------------------
 def main() -> None:
-    st.title("📊 Funds Dashboard")
-    st.caption(
-        f"Live re-pricing via yfinance · Auto-refresh every {REFRESH_SECONDS}s · "
-        f"Last tick: {datetime.now():%H:%M:%S}"
-    )
-
     sig = _data_signature(DATA_DIR)
     if not sig:
         st.warning("No .xlsx files found in `data/`. Drop your fund reports there.")
@@ -401,118 +435,62 @@ def main() -> None:
         st.error("Could not parse any files in `data/`.")
         return
 
-    # Sidebar
+    labels = sorted({f.fund_name for f in funds})
+
     with st.sidebar:
-        st.header("View")
-        labels = sorted({f.fund_name for f in funds})
-        choice = st.selectbox(
-            "Fund",
-            ["Combined"] + labels,
-            help="Combined merges all funds' holdings into a single view.",
-        )
+        st.markdown("### Fund")
+        choice = st.radio("Fund", labels, label_visibility="collapsed")
         st.markdown("---")
         if st.button("↻ Refresh prices now", use_container_width=True):
             pricing.clear_cache()
             st.rerun()
-        st.caption("Cache TTL: 60s for successful quotes, 5 min for failed ones.")
+        st.caption("Cache TTL: 60s ok / 5 min on failure.")
         st.markdown("---")
-        st.caption(f"Loaded {len(funds)} fund file(s):")
+        st.caption(f"Loaded {len(funds)} file(s):")
         for f in funds:
-            st.caption(f"• {f.fund_name} — {f.reporting_date} ({len(f.holdings)} hldg)")
+            st.caption(f"• {f.fund_name} — {f.reporting_date}")
 
-    # Pick the selected funds
-    selected = funds if choice == "Combined" else [f for f in funds if f.fund_name == choice]
+    fund = next(f for f in funds if f.fund_name == choice)
+    view = reprice_fund(fund)
 
-    # Reprice each
-    views = [reprice_fund(f) for f in selected]
-
-    # Combine into a synthetic "view" if needed
-    if len(views) == 1:
-        view = views[0]
-        single_label = view["fund"].fund_name
-    else:
-        view = _combine_views(views, label="Combined")
-        single_label = None
-
-    # KPIs
+    # 1. Title + KPIs
+    render_title(fund)
     render_kpis(view)
+
+    st.markdown("")  # spacer
+
+    # 2. Holdings table (left) + Sector pie (right)
+    left, right = st.columns([1.5, 1])
+    with left:
+        st.markdown("### Holdings")
+        render_holdings_table(view["holdings_df"], key_prefix=fund.fund_name + "_")
+    with right:
+        st.markdown("### Sector allocation")
+        render_sector_pie(view["holdings_df"])
+
     st.markdown("---")
 
-    # Allocation row
-    render_allocation_charts(view["holdings_df"])
+    # 3. Secondary allocations (compact tables)
+    render_secondary_allocations(view["holdings_df"])
 
-    # Top 10 + sector
     st.markdown("---")
-    c1, c2 = st.columns([1, 1])
+
+    # 4. Top 10 holdings + NAV history
+    c1, c2 = st.columns([1.2, 1])
     with c1:
         st.markdown("### Top 10 holdings")
         render_top10(view["holdings_df"])
     with c2:
-        st.markdown("### Sector allocation")
-        render_sector_chart(view["holdings_df"])
+        st.markdown("### NAV / unit history")
+        render_nav_history(funds, fund.fund_name)
 
-    # NAV history
+    # Footer
     st.markdown("---")
-    st.markdown("### NAV / unit history")
-    render_nav_history(funds, single_label)
-
-    # Holdings table
-    st.markdown("---")
-    st.markdown("### Holdings")
-    render_holdings_table(view["holdings_df"])
-
-    # NAV source config
-    st.markdown("---")
-    with st.expander("⚙ NAV source config"):
-        st.markdown(
-            "Currently NAV is computed real-time from holdings × live prices. "
-            "If you want to layer a published NAV feed on top, edit `config.yaml::nav_sources` "
-            "with a `url` per fund (JSON or HTML), then restart the app. "
-            "Historical NAV is built up automatically as you drop more dated xlsx files into `data/`."
-        )
-
-
-def _combine_views(views: list[dict], label: str) -> dict:
-    """Merge per-fund views into a single composite view for 'Combined' mode."""
-    df = pd.concat([v["holdings_df"] for v in views], ignore_index=True)
-    live_nav = sum(v["live_nav"] for v in views)
-    prev_nav = sum(v["prev_nav"] for v in views)
-    units = sum(v["fund"].units_outstanding for v in views)
-    cash_total = sum(v["cash_total"] for v in views)
-    stale = sum(v["stale_count"] for v in views)
-    other = sum(v["other_assets"] for v in views)
-    liab = sum(v["liabilities"] for v in views)
-    live_holdings = sum(v["live_holdings_total"] for v in views)
-
-    # Weight against combined total assets
-    total_assets = live_holdings + other
-    if total_assets:
-        df["Weight"] = df["Market value (live, EUR)"] / total_assets
-
-    class _Stub:
-        fund_name = label
-        reporting_date = max(v["fund"].reporting_date for v in views)
-        units_outstanding = units
-
-    return {
-        "fund": _Stub(),
-        "live_nav": live_nav,
-        "prev_nav": prev_nav,
-        "live_nav_per_unit": (live_nav / units) if units else 0,
-        "prev_nav_per_unit": (prev_nav / units) if units else 0,
-        "change_abs": live_nav - prev_nav,
-        "change_pct": ((live_nav / prev_nav - 1) * 100) if prev_nav else 0,
-        "change_per_unit_abs": ((live_nav - prev_nav) / units) if units else 0,
-        "holdings_df": df,
-        "live_holdings_total": live_holdings,
-        "other_assets": other,
-        "liabilities": liab,
-        "cash_total": cash_total,
-        "fx_used": views[0]["fx_used"],
-        "fx_book": views[0]["fx_book"],
-        "eurusd": views[0]["eurusd"],
-        "stale_count": stale,
-    }
+    st.caption(
+        f"USD/EUR live: **{view['fx_used']:.4f}** (book {view['fx_book']:.4f})  ·  "
+        f"Units outstanding: **{fund.units_outstanding:,.4f}**  ·  "
+        f"NAV % = SUMPRODUCT(weight × daily-return) over priced holdings"
+    )
 
 
 if __name__ == "__main__":
