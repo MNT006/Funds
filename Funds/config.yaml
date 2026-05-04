@@ -1,0 +1,35 @@
+# Funds Dashboard configuration
+#
+# Edit this file to extend sector mappings, add NAV-source URLs, or override
+# how individual tickers are looked up on Yahoo Finance.
+
+# Override or extend the built-in ticker → sector mapping in enrichment.py.
+# Keys are tickers as they appear in the xlsx (column "Борсов код").
+sector_overrides:
+  # NVDA: Technology
+  # ELGB: Corporate Bond — BG (Energy)
+
+# Map xlsx tickers to Yahoo symbols when they differ.
+# Useful for preferreds with non-standard punctuation, or share-class quirks.
+ticker_overrides:
+  # BRK.A: BRK-A
+
+# Tickers that yfinance cannot resolve. Their market value is held flat at
+# the xlsx number and excluded from the daily-change calculation.
+skip_tickers:
+  - ELGB
+  - TBIE
+  - SL23
+  - BIL
+
+# Optional NAV-from-URL source per fund. Leave blank to disable.
+# Matched against the fund's display name (case-insensitive substring).
+# Fields:
+#   url:     a public endpoint that returns either JSON or HTML
+#   json_path: dotted path inside the JSON, e.g. "data.nav"
+#   css:     a CSS selector that picks a single text node (HTML mode)
+#   regex:   a regex with one capture group, run on the fetched body
+nav_sources: {}
+  # Thracian — Innovation & Technology:
+  #   url: "https://example.com/api/nav?fund=innovation"
+  #   json_path: "nav_per_unit"
